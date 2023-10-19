@@ -1,11 +1,15 @@
 #!/bin/python
-from collections import defaultdict
+import asyncio
 import re
-import requests
 import subprocess
 import sys
 
-helptext = """Usage: redqu sub sort time
+import aiohttp
+
+REPOSITORY_URL = "https://github.com/port19x/redqu"
+
+
+HELP_TEXT = f"""Usage: redqu sub sort time
 Example: redqu cats top week
 
 Valid sort parameters: hot new top rising controversial
@@ -13,58 +17,93 @@ Valid time parameters: hour day week month year all
 Top of week is the default
 
 To report issues of any kind:
-https://github.com/port19x/redqu/issues"""
+{REPOSITORY_URL}/issues"""
 
-time = defaultdict(lambda: "?t=week") 
-time["h"] = "?t=hour"
-time["d"] = "?t=day"
-time["m"] = "?t=month"
-time["y"] = "?t=year"
-time["a"] = "?t=all"
 
-sort = defaultdict(lambda: "/top.rss")
-sort["h"] = "/hot.rss"
-sort["n"] = "/new.rss"
-sort["r"] = "/rising.rss"
-sort["c"] = "/controversial.rss"
+SESSION_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:101.0) Gecko/20100101 Firefox/101.0",
+}
 
-def redqu(sub, s="t", t="w", bot=False, n="0"):
-    endpoint = ''.join(["https://reddit.com/r/", sub, sort[s[0]], time[t[0]]])
-    agent = 'Mozilla/5.0 (X11; Linux x86_64; rv:101.0) Gecko/20100101 Firefox/101.0'
-    headers = {'User-Agent': agent}
-    resp = requests.get(endpoint, headers=headers)
-    fulltext = resp.content.decode()
-    
-    res = [r"https://i.redd.it/[a-z0-9]*.png",
-           r"https://i.redd.it/[a-z0-9]*.jpg",
-           r"https://i.redd.it/[a-z0-9]*.gif",
-           r"https://i.imgur.com/[a-zA-Z0-9]*.jpg",
-           r"https://i.imgur.com/[a-zA-Z0-9]*.png",]
 
-    if not bot:
-        res.append(r"https://v.redd.it/[a-z0-9]*",)
-        res.append(r"https://i.imgur.com/[a-zA-Z0-9]*.gifv")
-        res.append(r"https://redgifs.com/watch/[a-z]*")
+TIME_KEY_MAPPINGS = {
+    "h": "hour",
+    "d": "day",
+    "w": "week",
+    "m": "month",
+    "y": "year",
+    "a": "all",
+}
+CONTENT_CATEGORY_KEY_MAPPINGS = {
+    "h": "hot",
+    "n": "new",
+    "t": "top",
+    "r": "rising",
+    "c": "controversial",
+}
 
-    links = [re.findall(i, fulltext) for i in res]
-    links = [item for row in links for item in row]
 
-    if bot:
-        n = int(n)
-        links = links[5*n:5*n+5]
+PROTOCOL_RAW_REGEX = r"(?:(?:https?:)?//)?"
+REDDIT_URL = "https://reddit.com/"
 
-    return links
+IMAGE_MATCH_REGEXES = [
+    re.compile(PROTOCOL_RAW_REGEX + r"i\.redd\.it/[a-z0-9]+\.(?:png|jpe?g|gif)"),
+    re.compile(PROTOCOL_RAW_REGEX + r"i\.imgur\.com/[a-z0-9]+\.(?:png|jpe?g|gif)"),
+]
+
+CLI_SPECIFIC_MATCH_REGEXES = [
+    re.compile(PROTOCOL_RAW_REGEX + r"v\.redd\.it/[a-z0-9]+"),
+    re.compile(PROTOCOL_RAW_REGEX + r"i\.imgur\.com/[a-z0-9]+\.gifv?"),
+    re.compile(PROTOCOL_RAW_REGEX + r"redgifs\.com/watch/[a-z]+"),
+]
+
+
+async def redqu(
+    session: aiohttp.ClientSession,
+    subreddit: str,
+    s: str = "t",
+    t: str = "w",
+    *,
+    in_bot_context: bool = False,
+):
+    async with session.get(
+        REDDIT_URL
+        + f"/r/{subreddit}/"
+        + CONTENT_CATEGORY_KEY_MAPPINGS.get(s[:1], "top")
+        + ".rss",
+        params={"t": TIME_KEY_MAPPINGS.get(t[:1], "week")},
+    ) as response:
+        body = await response.text()
+
+        for regex in IMAGE_MATCH_REGEXES + (
+            CLI_SPECIFIC_MATCH_REGEXES if in_bot_context else []
+        ):
+            for match in regex.finditer(body):
+                yield match.group(0)
+
+
+async def __main__(*args):
+    session = aiohttp.ClientSession(headers=SESSION_HEADERS)
+
+    urls = []
+
+    async for url in redqu(session, *args):
+        urls.append(url)
+
+    await session.close()
+    return urls
+
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if (len(args) == 1):
-        links = redqu(args[0])
-    elif (len(args) == 2):
-        links = redqu(args[0], args[1])
-    elif (len(args) == 3):
-        links = redqu(args[0], args[1], args[2])
-    else:
-        print(helptext)
-        exit(1)
-    links.insert(0, "mpv")
-    subprocess.run(links)
+
+    loop = asyncio.new_event_loop()
+
+    if len(args) < 4:
+        exit(
+            subprocess.run(
+                ("mpv", *loop.run_until_complete(__main__(*args)))
+            ).returncode
+        )
+
+    print(HELP_TEXT)
+    exit(1)
